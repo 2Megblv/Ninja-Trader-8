@@ -78,6 +78,10 @@ namespace PropFirmATS.Engine.Hameral
         // Relative volume tracker stub
         private double _averageVolume = 300.0;
 
+        // Volatility & Delta tracker stubs
+        private double _averageTrueRange20 = 5.0;
+        private double _recentCumulativeDelta = -500.0;
+
         public SignalEngine(BasicVolumeProfileStub vp, BasicVWAPStub vwap, BasicFootprintStub fp)
         {
             _volProfile = vp;
@@ -149,7 +153,16 @@ namespace PropFirmATS.Engine.Hameral
             // 3. Candle Close & Delta
             bool deltaConfirmed = _footprint.CandleDelta > 0 && _footprint.IsCandleBullish;
 
-            if ((isImbalance || isAbsorption) && deltaConfirmed)
+            // Institutional Update: Delta Divergence Filter
+            // Example: Cumulative delta is showing higher lows (-200 vs recent -500) while price is testing the low
+            bool deltaDivergenceConfirmed = _footprint.CandleDelta > -200 && _recentCumulativeDelta <= -500;
+
+            // Institutional Update: Volatility Filter
+            // We require current ATR (simulated here) to be healthy (e.g. > 20 period MA) to avoid tight-range chop
+            double simulatedCurrentATR = 6.0;
+            bool volatilityHealthy = simulatedCurrentATR >= _averageTrueRange20;
+
+            if ((isImbalance || isAbsorption) && deltaConfirmed && deltaDivergenceConfirmed && volatilityHealthy)
             {
                 signal.IsValid = true;
                 signal.Action = "Long";

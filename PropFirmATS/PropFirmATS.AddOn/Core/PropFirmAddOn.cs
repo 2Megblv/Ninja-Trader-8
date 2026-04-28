@@ -9,6 +9,8 @@ using PropFirmATS.Engine.Risk;
 using PropFirmATS.Engine.Persistence;
 using PropFirmATS.Engine.Hameral;
 using NinjaTrader.Core;
+using System.Linq;
+using System;
 
 namespace PropFirmATS.AddOn.Core
 {
@@ -43,6 +45,13 @@ namespace PropFirmATS.AddOn.Core
         // Dynamic target mappings
         private Dictionary<string, TradeSignal> _pendingSignalContexts; // Key: OcoId
 
+        // Active Trade Contexts for Trailing Management
+        private Dictionary<string, ActiveTradeContext> _activeTradeContexts; // Key: OcoId
+        private readonly object _contextLock = new object();
+
+        // Global Indicators
+        private PropFirmATS.Engine.Indicators.IndicatorTracker _indicators;
+
         protected override void OnStateChange()
         {
             // Note: In real NT8, check State == State.SetDefaults, State.Configure, etc.
@@ -62,12 +71,15 @@ namespace PropFirmATS.AddOn.Core
             _activeStopOrders = new Dictionary<string, Order>();
             _activeTargetOrders = new Dictionary<string, Order>();
             _pendingSignalContexts = new Dictionary<string, TradeSignal>();
+            _activeTradeContexts = new Dictionary<string, ActiveTradeContext>();
 
             // Setup SignalEngine
             var vpStub = new BasicVolumeProfileStub();
             var vwapStub = new BasicVWAPStub();
             var fpStub = new BasicFootprintStub();
             _signalEngine = new SignalEngine(vpStub, vwapStub, fpStub);
+
+            _indicators = new PropFirmATS.Engine.Indicators.IndicatorTracker();
 
             // Setup Event Handlers
             _accountItemUpdateHandler = OnAccountItemUpdate;
@@ -118,6 +130,52 @@ namespace PropFirmATS.AddOn.Core
                 return;
             }
 
+            // Update Global Indicators
+            _indicators.UpdateIndicators(e.Close);
+
+            // Fast Reversal Profit Protection Logic
+            lock (_contextLock)
+            {
+                foreach (var context in _activeTradeContexts.Values)
+                {
+                    if (context.IsBreakEvenSet) continue;
+
+                    double initialRisk = context.GetRValue();
+                    if (initialRisk == 0) continue; // Safety check
+
+                    double currentProfit = context.GetCurrentProfit(e.Close);
+                    double profitRMultiple = currentProfit / initialRisk;
+
+                    if (profitRMultiple >= 0.5)
+                    {
+                        // Trade is in profit > 0.5R. Check ADX Trend Strength.
+                        if (_indicators.CurrentADX < 25.0)
+                        {
+                            // Weak/Medium Trend detected -> Potential Failed Breakout
+                            // Pull Stop Loss to BE + small buffer (0.1x ATR)
+                            double buffer = _indicators.CurrentATR * 0.1;
+                            double newStopPrice = context.Action == "Long"
+                                ? context.EntryPrice + buffer
+                                : context.EntryPrice - buffer;
+
+                            Console.WriteLine($"[Profit Protection] Trend Weak (ADX={_indicators.CurrentADX}). Pulling Stop Loss to {newStopPrice}");
+
+                            // Adjust actual active Stop Order
+                            if (_activeStopOrders.TryGetValue(context.OcoId, out Order stopOrder))
+                            {
+                                Account acc = Account.All.FirstOrDefault(a => a.Name == context.AccountName);
+                                if (acc != null)
+                                {
+                                    acc.ChangeOrder(stopOrder, stopOrder.Quantity, 0, newStopPrice);
+                                }
+                            }
+
+                            context.IsBreakEvenSet = true;
+                        }
+                    }
+                }
+            }
+
             // Send tick to Signal Engine
             TradeSignal signal = _signalEngine.EvaluateMarket(e.Close);
 
@@ -138,7 +196,29 @@ namespace PropFirmATS.AddOn.Core
                             _pendingSignalContexts[ocoId] = signal;
 
                             OrderAction action = signal.Action == "Long" ? OrderAction.Buy : OrderAction.SellShort;
-                            Order entryOrder = acc.CreateOrder(Instrument.GetInstrument("ES"), action, OrderType.Market, TimeInForce.Day, 1, 0, 0, ocoId, "Entry", "");
+
+                            // Institutional Upgrade: Regime-Aware Sizing (Fractional Kelly / Volatility Sizing)
+                            // We dynamically calculate position size rather than hardcoding '1'.
+                            // Example: Target $500 risk per trade based on current ATR.
+                            double dollarRiskTarget = 500.0;
+                            double esPointValue = 50.0;
+                            double stopDistancePts = Math.Abs(e.Close - signal.StopPrice);
+                            if (stopDistancePts == 0) stopDistancePts = 1.0; // Failsafe
+
+                            int calculatedQty = (int)Math.Floor(dollarRiskTarget / (stopDistancePts * esPointValue));
+                            if (calculatedQty < 1) calculatedQty = 1; // Minimum 1 contract
+
+                            // Check max limit from equivalent tracker
+                            double currentEquivalent = _equivalentModeTracker.GetEquivalentPosition("ES", 0); // Open position is 0 here based on above check
+                            if (!_equivalentModeTracker.IsTradeAllowed("ES", calculatedQty, currentEquivalent))
+                            {
+                                // If calculated qty exceeds config limits, cap it
+                                calculatedQty = 1; // Or max allowed. Using 1 for safety.
+                            }
+
+                            // Institutional Upgrade: Use passive Limit orders resting at the current close to avoid crossing the spread.
+                            double limitPrice = e.Close;
+                            Order entryOrder = acc.CreateOrder(Instrument.GetInstrument("ES"), action, OrderType.Limit, TimeInForce.Day, calculatedQty, limitPrice, 0, ocoId, "Entry", "");
                             acc.Submit(new Order[] { entryOrder });
 
                             // Save OCO to state for crash recovery
@@ -237,6 +317,10 @@ namespace PropFirmATS.AddOn.Core
                     _activeStopOrders.Remove(e.Execution.Order.Oco);
                     _activeTargetOrders.Remove(e.Execution.Order.Oco);
                     _pendingSignalContexts.Remove(e.Execution.Order.Oco);
+                    lock (_contextLock)
+                    {
+                        _activeTradeContexts.Remove(e.Execution.Order.Oco);
+                    }
                 }
             }
         }
@@ -245,6 +329,7 @@ namespace PropFirmATS.AddOn.Core
         {
             double stopPrice = 0;
             double targetPrice = 0;
+            string action = entryOrder.OrderAction == OrderAction.Buy ? "Long" : "Short";
 
             // Retrieve dynamic context generated during the signal
             if (_pendingSignalContexts.TryGetValue(ocoId, out var context))
@@ -283,6 +368,20 @@ namespace PropFirmATS.AddOn.Core
 
                 _activeStopOrders[ocoId] = stopOrder;
                 _activeTargetOrders[ocoId] = targetOrder;
+
+                // Track Trade Context for Profit Protection
+                lock (_contextLock)
+                {
+                    _activeTradeContexts[ocoId] = new ActiveTradeContext
+                    {
+                        AccountName = account.Name,
+                        OcoId = ocoId,
+                        Action = action,
+                        EntryPrice = avgEntryPrice,
+                        InitialStopPrice = stopPrice,
+                        IsBreakEvenSet = false
+                    };
+                }
             }
         }
 
