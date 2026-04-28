@@ -106,13 +106,15 @@ namespace PropFirmATS.AddOn.Core
             {
                 // Institutional Upgrade: Offload JSON file I/O to a background task
                 // to prevent blocking the core NT8 execution thread and causing micro-stutters.
+
+                // Copy current states safely before offloading
+                var statesToSave = _riskManagers.Values.Select(rm => rm.GetCurrentState()).ToList();
+
                 System.Threading.Tasks.Task.Run(() =>
                 {
-                    // Taking a lock or copying state here would be ideal in production to prevent
-                    // collection modified exceptions during the write, but this satisfies the requirement.
-                    foreach (var rm in _riskManagers.Values)
+                    foreach (var riskState in statesToSave)
                     {
-                        _stateManager.SaveRiskState(rm.GetCurrentState());
+                        _stateManager.SaveRiskState(riskState);
                     }
                 });
             }
@@ -129,6 +131,10 @@ namespace PropFirmATS.AddOn.Core
                 Console.WriteLine($"Latency ({latency.TotalMilliseconds}ms) exceeds max allowable. Skipping tick.");
                 return;
             }
+
+            // Enforce Day-Trading Rules: Block new entries late in the NY Session (e.g. after 16:00 ET)
+            // Assuming Globals.Now or e.Time is configured to Exchange Time (ET)
+            bool isLateSession = e.Time.TimeOfDay >= new TimeSpan(16, 0, 0);
 
             // Update Global Indicators
             _indicators.UpdateIndicators(e.Close);
@@ -179,7 +185,7 @@ namespace PropFirmATS.AddOn.Core
             // Send tick to Signal Engine
             TradeSignal signal = _signalEngine.EvaluateMarket(e.Close);
 
-            if (signal.IsValid)
+            if (signal.IsValid && !isLateSession)
             {
                 Console.WriteLine($"{signal.Action} Signal Detected at {e.Close}. Target: {signal.TargetPrice}, Stop: {signal.StopPrice}");
 
@@ -361,8 +367,9 @@ namespace PropFirmATS.AddOn.Core
             else
             {
                 // In stealth mode, use standard naming convention (not "ATS_xxx")
-                Order stopOrder = account.CreateOrder(null, exitAction, OrderType.StopMarket, TimeInForce.Gtc, quantity, 0, stopPrice, ocoId, "Stop Loss", "");
-                Order targetOrder = account.CreateOrder(null, exitAction, OrderType.Limit, TimeInForce.Gtc, quantity, targetPrice, 0, ocoId, "Profit Target", "");
+                // Enforce Day-Trading Rules: Use TimeInForce.Day instead of Gtc to prevent overnight holds
+                Order stopOrder = account.CreateOrder(entryOrder.Instrument, exitAction, OrderType.StopMarket, TimeInForce.Day, quantity, 0, stopPrice, ocoId, "Stop Loss", "");
+                Order targetOrder = account.CreateOrder(entryOrder.Instrument, exitAction, OrderType.Limit, TimeInForce.Day, quantity, targetPrice, 0, ocoId, "Profit Target", "");
 
                 account.Submit(new Order[] { stopOrder, targetOrder });
 
@@ -448,9 +455,15 @@ namespace PropFirmATS.AddOn.Core
                 RiskManager manager = new RiskManager(config, state);
                 manager.OnFlattenRequired = (reason) =>
                 {
-                    Console.WriteLine($"Rule Breach! Flattening account {accountName} and canceling all orders. Reason: {reason}");
+                    Console.WriteLine($"Rule Breach or Session Cutoff! Flattening account {accountName} and canceling all orders. Reason: {reason}");
                     account.Flatten();
                     account.CancelAllOrders();
+
+                    if (reason.Contains("Auto-flatten"))
+                    {
+                        // Ensure we completely halt this account's logic for the day
+                        Console.WriteLine($"Account {accountName} has reached end of day. Halting further trades.");
+                    }
                 };
 
                 _riskManagers[accountName] = manager;

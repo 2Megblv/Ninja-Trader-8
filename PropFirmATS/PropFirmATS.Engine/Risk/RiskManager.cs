@@ -27,6 +27,7 @@ namespace PropFirmATS.Engine.Risk
     {
         private PropFirmAccountConfig _config;
         private RiskState _state;
+        private bool _isFlattenedForDay = false;
 
         // Action delegate to trigger account flatten, passes string reason
         public Action<string> OnFlattenRequired { get; set; }
@@ -48,9 +49,13 @@ namespace PropFirmATS.Engine.Risk
             double currentEquity = currentBalance + openPnl;
 
             // 1. Auto-Flatten Cutoff
-            if (currentTime.TimeOfDay >= _config.AutoFlattenTime && currentTime.TimeOfDay < _config.AutoFlattenTime.Add(TimeSpan.FromMinutes(1)))
+            if (currentTime.TimeOfDay >= _config.AutoFlattenTime)
             {
-                TriggerFlatten("Auto-flatten time reached.");
+                if (!_isFlattenedForDay)
+                {
+                    _isFlattenedForDay = true;
+                    TriggerFlatten("Auto-flatten time reached. Session End.");
+                }
                 return;
             }
 
@@ -99,8 +104,9 @@ namespace PropFirmATS.Engine.Risk
 
         public void OnSessionClose(double currentBalance)
         {
-            // Reset daily PNL
+            // Reset daily limits
             _state.DailyRealizedPnl = 0;
+            _isFlattenedForDay = false;
 
             if (_config.DrawdownType == DrawdownType.TrailingEOD)
             {
