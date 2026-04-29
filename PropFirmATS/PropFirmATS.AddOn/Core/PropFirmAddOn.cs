@@ -140,9 +140,25 @@ namespace PropFirmATS.AddOn.Core
             // Requires high confidence analysis; we hardblock execution in this window.
             bool isAsianOpenBlackout = e.Time.TimeOfDay >= new TimeSpan(17, 0, 0) && e.Time.TimeOfDay <= new TimeSpan(20, 0, 0);
 
-            // 2. Liquidity / Spread Check: Ensure the spread is tight enough before entering.
-            // Example for ES: max spread 0.75 points (3 ticks).
-            bool isLiquidityAdequate = _indicators.CurrentSpread <= 0.75;
+            // 2. Prep & HFT Session Definitions (London 03:00 ET, NY 09:30 ET)
+            TimeSpan londonPrepStart = new TimeSpan(2, 45, 0);
+            TimeSpan londonHftStart = new TimeSpan(3, 0, 0);
+            TimeSpan londonHftEnd = new TimeSpan(3, 15, 0);
+
+            TimeSpan nyPrepStart = new TimeSpan(9, 15, 0);
+            TimeSpan nyHftStart = new TimeSpan(9, 30, 0);
+            TimeSpan nyHftEnd = new TimeSpan(9, 45, 0);
+
+            bool isPrepWindow = (e.Time.TimeOfDay >= londonPrepStart && e.Time.TimeOfDay < londonHftStart) ||
+                                (e.Time.TimeOfDay >= nyPrepStart && e.Time.TimeOfDay < nyHftStart);
+
+            bool isHftWindow = (e.Time.TimeOfDay >= londonHftStart && e.Time.TimeOfDay <= londonHftEnd) ||
+                               (e.Time.TimeOfDay >= nyHftStart && e.Time.TimeOfDay <= nyHftEnd);
+
+            // 3. Liquidity / Spread Check: Ensure the spread is tight enough before entering.
+            // Example for ES: max spread 0.75 points (3 ticks). During Prep windows, we demand even tighter liquidity (e.g. 0.5 points / 2 ticks) to prepare for the bell.
+            double maxAllowedSpread = isPrepWindow ? 0.50 : 0.75;
+            bool isLiquidityAdequate = _indicators.CurrentSpread <= maxAllowedSpread;
 
             // Daily Rollover Evaluation Logic (e.g. 16:45 ET Check)
             bool isRolloverWindow = e.Time.TimeOfDay >= new TimeSpan(16, 45, 0) && e.Time.TimeOfDay <= new TimeSpan(16, 50, 0);
@@ -160,7 +176,40 @@ namespace PropFirmATS.AddOn.Core
                     double currentProfit = context.GetCurrentProfit(e.Close);
                     double profitRMultiple = currentProfit / initialRisk;
 
-                    if (profitRMultiple >= 0.5)
+                    // Track peak profit
+                    if (currentProfit > context.HighestRecordedProfit)
+                    {
+                        context.HighestRecordedProfit = currentProfit;
+                    }
+
+                    // Mode Selection: HFT Management vs Standard Swing Protection
+                    if (isHftWindow)
+                    {
+                        if (!context.IsHftFlattenTriggered)
+                        {
+                            // HFT Spike Reversal Filter: If trade is in minor profit (> 0.2 ATR)
+                            // and drops from its peak profit by a quick threshold (e.g. 0.25 ATR),
+                            // instantly flatten to secure the fast opening-bell gains.
+                            double minimumHftProfitThreshold = _indicators.CurrentATR * 0.2;
+                            double hftReversalTolerance = _indicators.CurrentATR * 0.25;
+
+                            if (context.HighestRecordedProfit > minimumHftProfitThreshold)
+                            {
+                                if (currentProfit <= (context.HighestRecordedProfit - hftReversalTolerance))
+                                {
+                                    Console.WriteLine($"[HFT Session Protection] Erratic reversal detected. Flattening OCO {context.OcoId} to secure opening bell spike.");
+                                    Account acc = Account.All.FirstOrDefault(a => a.Name == context.AccountName);
+                                    if (acc != null)
+                                    {
+                                        acc.Flatten();
+                                    }
+                                    context.IsHftFlattenTriggered = true;
+                                    continue; // Skip the rest of the loop for this context
+                                }
+                            }
+                        }
+                    }
+                    else if (profitRMultiple >= 0.5) // Standard Swing Protection
                     {
                         // Trade is in profit > 0.5R. Check ADX Trend Strength.
                         if (_indicators.CurrentADX < 25.0)

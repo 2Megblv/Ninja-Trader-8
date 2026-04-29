@@ -11,6 +11,9 @@ namespace PropFirmATS.Engine.Risk
         public bool IsBreakEvenSet { get; set; }
         public bool IsRolloverFlattenTriggered { get; set; }
 
+        public double HighestRecordedProfit { get; set; }
+        public bool IsHftFlattenTriggered { get; set; }
+
         public double GetRValue()
         {
             return System.Math.Abs(EntryPrice - InitialStopPrice);
