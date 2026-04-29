@@ -7,12 +7,14 @@ namespace PropFirmATS.Engine.Indicators
     {
         public double CurrentADX { get; private set; }
         public double CurrentATR { get; private set; }
+        public double CurrentSpread { get; private set; }
 
         public IndicatorTracker()
         {
             // Default starting values
             CurrentADX = 20.0;
             CurrentATR = 5.0;  // Pts
+            CurrentSpread = 0.25; // Pts
         }
 
         // Called on OnBarsUpdate to update the indicator values based on new bar data

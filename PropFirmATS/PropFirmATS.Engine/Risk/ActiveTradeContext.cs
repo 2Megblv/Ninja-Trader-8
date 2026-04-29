@@ -7,7 +7,9 @@ namespace PropFirmATS.Engine.Risk
         public string Action { get; set; } // "Long" or "Short"
         public double EntryPrice { get; set; }
         public double InitialStopPrice { get; set; }
+        public double TargetPrice { get; set; }
         public bool IsBreakEvenSet { get; set; }
+        public bool IsRolloverFlattenTriggered { get; set; }
 
         public double GetRValue()
         {

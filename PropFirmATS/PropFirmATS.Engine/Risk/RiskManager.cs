@@ -21,6 +21,27 @@ namespace PropFirmATS.Engine.Risk
 
         // Active Orders Persistence (InstrumentName -> OcoId)
         public System.Collections.Generic.Dictionary<string, string> ActiveOcoIds { get; set; } = new System.Collections.Generic.Dictionary<string, string>();
+
+        public RiskState Clone()
+        {
+            var clone = new RiskState
+            {
+                AccountName = this.AccountName,
+                HighWaterMarkRealized = this.HighWaterMarkRealized,
+                HighWaterMarkUnrealized = this.HighWaterMarkUnrealized,
+                IsDrawdownFloorLocked = this.IsDrawdownFloorLocked,
+                LockedDrawdownFloor = this.LockedDrawdownFloor,
+                DailyRealizedPnl = this.DailyRealizedPnl,
+                ActiveOcoIds = new System.Collections.Generic.Dictionary<string, string>()
+            };
+
+            foreach (var kvp in this.ActiveOcoIds)
+            {
+                clone.ActiveOcoIds.Add(kvp.Key, kvp.Value);
+            }
+
+            return clone;
+        }
     }
 
     public class RiskManager
@@ -48,13 +69,13 @@ namespace PropFirmATS.Engine.Risk
         {
             double currentEquity = currentBalance + openPnl;
 
-            // 1. Auto-Flatten Cutoff
-            if (currentTime.TimeOfDay >= _config.AutoFlattenTime)
+            // 1. Friday EOD Hard Close Cutoff
+            if (currentTime.DayOfWeek == DayOfWeek.Friday && currentTime.TimeOfDay >= _config.AutoFlattenTime)
             {
                 if (!_isFlattenedForDay)
                 {
                     _isFlattenedForDay = true;
-                    TriggerFlatten("Auto-flatten time reached. Session End.");
+                    TriggerFlatten("Friday EOD Cutoff reached. Closing all trades for the weekend.");
                 }
                 return;
             }

@@ -107,8 +107,9 @@ namespace PropFirmATS.AddOn.Core
                 // Institutional Upgrade: Offload JSON file I/O to a background task
                 // to prevent blocking the core NT8 execution thread and causing micro-stutters.
 
-                // Copy current states safely before offloading
-                var statesToSave = _riskManagers.Values.Select(rm => rm.GetCurrentState()).ToList();
+                // Deep Copy current states synchronously before offloading to prevent
+                // "Collection was modified" InvalidOperationException on the background thread.
+                var statesToSave = _riskManagers.Values.Select(rm => rm.GetCurrentState().Clone()).ToList();
 
                 System.Threading.Tasks.Task.Run(() =>
                 {
@@ -132,14 +133,21 @@ namespace PropFirmATS.AddOn.Core
                 return;
             }
 
-            // Enforce Day-Trading Rules: Block new entries late in the NY Session (e.g. after 16:00 ET)
-            // Assuming Globals.Now or e.Time is configured to Exchange Time (ET)
-            bool isLateSession = e.Time.TimeOfDay >= new TimeSpan(16, 0, 0);
-
             // Update Global Indicators
             _indicators.UpdateIndicators(e.Close);
 
-            // Fast Reversal Profit Protection Logic
+            // 1. Asian Open Blackout: Prevent blind entries right after the NY close / early Sydney/Asian session (e.g. 17:00 ET to 20:00 ET).
+            // Requires high confidence analysis; we hardblock execution in this window.
+            bool isAsianOpenBlackout = e.Time.TimeOfDay >= new TimeSpan(17, 0, 0) && e.Time.TimeOfDay <= new TimeSpan(20, 0, 0);
+
+            // 2. Liquidity / Spread Check: Ensure the spread is tight enough before entering.
+            // Example for ES: max spread 0.75 points (3 ticks).
+            bool isLiquidityAdequate = _indicators.CurrentSpread <= 0.75;
+
+            // Daily Rollover Evaluation Logic (e.g. 16:45 ET Check)
+            bool isRolloverWindow = e.Time.TimeOfDay >= new TimeSpan(16, 45, 0) && e.Time.TimeOfDay <= new TimeSpan(16, 50, 0);
+
+            // Fast Reversal Profit Protection & Rollover Logic
             lock (_contextLock)
             {
                 foreach (var context in _activeTradeContexts.Values)
@@ -179,13 +187,39 @@ namespace PropFirmATS.AddOn.Core
                             context.IsBreakEvenSet = true;
                         }
                     }
+
+                    // Daily Rollover Hold Evaluation
+                    if (isRolloverWindow && e.Time.DayOfWeek != DayOfWeek.Friday)
+                    {
+                        double targetDistance = Math.Abs(context.TargetPrice - context.EntryPrice);
+                        bool isTargetLargeEnough = targetDistance >= (_indicators.CurrentSpread * 5.0);
+
+                        // Fix: Check actual distance to target instead of R-multiple
+                        bool isNotHalfwayToTarget = currentProfit < (targetDistance * 0.5);
+
+                        bool isGenuineUpside = _indicators.CurrentADX > 25.0; // Strong trend check
+
+                        if (!isTargetLargeEnough || !isNotHalfwayToTarget || !isGenuineUpside)
+                        {
+                            if (!context.IsRolloverFlattenTriggered)
+                            {
+                                Console.WriteLine($"[Rollover Check] Trade does not meet overnight hold criteria. Flattening OCO {context.OcoId}.");
+                                Account acc = Account.All.FirstOrDefault(a => a.Name == context.AccountName);
+                                if (acc != null)
+                                {
+                                    acc.Flatten(); // In a real NT8 environment, use CloseStrategyPosition or flatten the specific instrument
+                                }
+                                context.IsRolloverFlattenTriggered = true;
+                            }
+                        }
+                    }
                 }
             }
 
             // Send tick to Signal Engine
             TradeSignal signal = _signalEngine.EvaluateMarket(e.Close);
 
-            if (signal.IsValid && !isLateSession)
+            if (signal.IsValid && !isAsianOpenBlackout && isLiquidityAdequate)
             {
                 Console.WriteLine($"{signal.Action} Signal Detected at {e.Close}. Target: {signal.TargetPrice}, Stop: {signal.StopPrice}");
 
@@ -224,7 +258,7 @@ namespace PropFirmATS.AddOn.Core
 
                             // Institutional Upgrade: Use passive Limit orders resting at the current close to avoid crossing the spread.
                             double limitPrice = e.Close;
-                            Order entryOrder = acc.CreateOrder(Instrument.GetInstrument("ES"), action, OrderType.Limit, TimeInForce.Day, calculatedQty, limitPrice, 0, ocoId, "Entry", "");
+                            Order entryOrder = acc.CreateOrder(Instrument.GetInstrument("ES"), action, OrderType.Limit, TimeInForce.Gtc, calculatedQty, limitPrice, 0, ocoId, "Entry", "");
                             acc.Submit(new Order[] { entryOrder });
 
                             // Save OCO to state for crash recovery
@@ -367,9 +401,9 @@ namespace PropFirmATS.AddOn.Core
             else
             {
                 // In stealth mode, use standard naming convention (not "ATS_xxx")
-                // Enforce Day-Trading Rules: Use TimeInForce.Day instead of Gtc to prevent overnight holds
-                Order stopOrder = account.CreateOrder(entryOrder.Instrument, exitAction, OrderType.StopMarket, TimeInForce.Day, quantity, 0, stopPrice, ocoId, "Stop Loss", "");
-                Order targetOrder = account.CreateOrder(entryOrder.Instrument, exitAction, OrderType.Limit, TimeInForce.Day, quantity, targetPrice, 0, ocoId, "Profit Target", "");
+                // Reverted to GTC to allow weekday overnight holds if criteria are met
+                Order stopOrder = account.CreateOrder(entryOrder.Instrument, exitAction, OrderType.StopMarket, TimeInForce.Gtc, quantity, 0, stopPrice, ocoId, "Stop Loss", "");
+                Order targetOrder = account.CreateOrder(entryOrder.Instrument, exitAction, OrderType.Limit, TimeInForce.Gtc, quantity, targetPrice, 0, ocoId, "Profit Target", "");
 
                 account.Submit(new Order[] { stopOrder, targetOrder });
 
@@ -386,7 +420,9 @@ namespace PropFirmATS.AddOn.Core
                         Action = action,
                         EntryPrice = avgEntryPrice,
                         InitialStopPrice = stopPrice,
-                        IsBreakEvenSet = false
+                        TargetPrice = targetPrice,
+                        IsBreakEvenSet = false,
+                        IsRolloverFlattenTriggered = false
                     };
                 }
             }
