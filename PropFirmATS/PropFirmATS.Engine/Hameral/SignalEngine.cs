@@ -78,6 +78,19 @@ namespace PropFirmATS.Engine.Hameral
         // Relative volume tracker stub
         private double _averageVolume = 300.0;
 
+        // Multi-Timeframe (MTF) Trend Bias Stubs (e.g. 5M, 1H, 4H)
+        // Simulated tracking of higher timeframe SMA/VWAP slopes. > 0 is Bullish, < 0 is Bearish.
+        private double _trendBias5M = 1.0;
+        private double _trendBias1H = 1.0;
+        private double _trendBias4H = 1.0;
+
+        // Simulating slope calculations for MTF context
+        // In a real environment, this would compare the higher timeframe's close to its own moving average or VWAP.
+        // Here we simulate the trend state (e.g. comparing close price to a simulated long-term SMA).
+        public void UpdateTrendBias5M(double closePrice) { _trendBias5M = closePrice > (_vwap.VWAP + 5) ? 1.0 : -1.0; }
+        public void UpdateTrendBias1H(double closePrice) { _trendBias1H = closePrice > (_vwap.VWAP + 20) ? 1.0 : -1.0; }
+        public void UpdateTrendBias4H(double closePrice) { _trendBias4H = closePrice > (_vwap.VWAP + 50) ? 1.0 : -1.0; }
+
         public SignalEngine(BasicVolumeProfileStub vp, BasicVWAPStub vwap, BasicFootprintStub fp)
         {
             _volProfile = vp;
@@ -140,21 +153,44 @@ namespace PropFirmATS.Engine.Hameral
             double currentTotalVol = _footprint.AskVolume + _footprint.BidVolume;
 
             // 1 & 2. Absorption & Imbalance Detection
-            bool isImbalance = _footprint.AskVolume >= (_footprint.BidVolume * 3);
+            bool isBullishImbalance = _footprint.AskVolume >= (_footprint.BidVolume * 3);
+            bool isBearishImbalance = _footprint.BidVolume >= (_footprint.AskVolume * 3);
 
             // Institutional Update: Use relative volume instead of hardcoded 1000
             bool isHighRelativeVolume = currentTotalVol > (_averageVolume * 2);
-            bool isAbsorption = isHighRelativeVolume && (_footprint.CandleDelta > 0);
+            bool isBullishAbsorption = isHighRelativeVolume && (_footprint.CandleDelta > 0);
+            bool isBearishAbsorption = isHighRelativeVolume && (_footprint.CandleDelta < 0);
 
             // 3. Candle Close & Delta
-            bool deltaConfirmed = _footprint.CandleDelta > 0 && _footprint.IsCandleBullish;
+            bool bullishDeltaConfirmed = _footprint.CandleDelta > 0 && _footprint.IsCandleBullish;
+            bool bearishDeltaConfirmed = _footprint.CandleDelta < 0 && !_footprint.IsCandleBullish;
 
-            if ((isImbalance || isAbsorption) && deltaConfirmed)
+            // 4. MTF Trend Alignment (Directional Filter)
+            // We use 1H/4H strictly to confirm the broad directional bias.
+            bool isMtfBullishAligned = _trendBias1H > 0 && _trendBias4H > 0;
+            bool isMtfBearishAligned = _trendBias1H < 0 && _trendBias4H < 0;
+
+            // The 5M is used for immediate momentum confirmation
+            bool isImmediateMomentumBullish = _trendBias5M > 0;
+            bool isImmediateMomentumBearish = _trendBias5M < 0;
+
+            // Long Evaluation
+            if ((isBullishImbalance || isBullishAbsorption) && bullishDeltaConfirmed && isMtfBullishAligned && isImmediateMomentumBullish)
             {
                 signal.IsValid = true;
                 signal.Action = "Long";
                 signal.TargetPrice = calculatedTarget;
                 signal.StopPrice = calculatedStop;
+            }
+            // Short Evaluation
+            else if ((isBearishImbalance || isBearishAbsorption) && bearishDeltaConfirmed && isMtfBearishAligned && isImmediateMomentumBearish)
+            {
+                signal.IsValid = true;
+                signal.Action = "Short";
+
+                // Inverse targets for shorts (mock structural levels)
+                signal.TargetPrice = _vwap.StdDev2Lower; // Example
+                signal.StopPrice = _vwap.VWAP + 2.0;
             }
 
             return signal;
