@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="PropFirmATS.AddOn/PropFirmATS.AddOn.csproj" />
+  <Project Path="PropFirmATS.Engine/PropFirmATS.Engine.csproj" />
+</Solution>

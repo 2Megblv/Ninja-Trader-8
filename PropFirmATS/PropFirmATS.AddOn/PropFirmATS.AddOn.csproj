@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net48</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <UseWPF>true</UseWPF>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\PropFirmATS.Engine\PropFirmATS.Engine.csproj" />
+  </ItemGroup>
+
+  <!-- In a real NT8 environment, this would reference NinjaTrader Core, Gui, Custom DLLs -->
+</Project>
